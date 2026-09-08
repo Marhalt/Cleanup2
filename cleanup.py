@@ -1,7 +1,9 @@
 import argparse
 import json
 import os
+import shlex
 import sys
+from urllib.parse import unquote, urlparse
 
 import requests
 
@@ -30,6 +32,23 @@ RESPONSE_MAX_TOKENS = 500    # generous for a single small JSON object; this mod
                              # and content comes back empty if reasoning exhausts the budget first.
 
 REVIEW_MAX_REMOVED_RATIO = 0.9  # flag to review/ instead of cleaned/ if more than this fraction is cut
+
+# --- Iterative re-scan for residual metadata --------------------------------
+# The first pass is windowed and reports only one metadata boundary per window, so a heavily-cut
+# file tends to leave a few residual byline/title lines the scan walked past — the ones not short
+# enough or not sandwiched between two cuts for verify_sandwiched_gaps to catch. Re-scanning the
+# already-cleaned text picks them up because they now sit in clean, correctly-numbered context.
+# This is deliberately gated and bounded: a blanket rescan of every cleaned file was tried before
+# and over-deleted legitimate prose (see the verify_sandwiched_gaps note), so only files that were
+# cut heavily get a second look, only a few passes run, and any pass that wants to remove more
+# than a small margin routes the file to review/ instead of being trusted.
+RESCAN_TRIGGER_RATIO  = 0.05  # re-scan if the first pass removed at least this fraction of lines...
+RESCAN_TRIGGER_CUTS   = 5     # ...or produced at least this many separate cut ranges
+RESCAN_MAX_PASSES     = 3     # hard cap on total scan_pass runs (1 initial + up to 2 re-scans)
+RESCAN_SAFE_RATIO     = 0.03  # a re-scan removing more than this fraction of ITS OWN input is
+                              # treated as untrustworthy and routed to review/ ...
+RESCAN_SAFE_MIN_LINES = 5     # ...but always tolerate removing at least this many lines, so a
+                              # small trailing-byline cleanup on a short file doesn't trip the guard
 
 # --- Schemas -----------------------------------------------------------------
 
@@ -184,19 +203,35 @@ def verify_sandwiched_gaps(model_id, lines, cuts, debug=False):
 # =============================================================
 
 def get_model_info(debug=False):
-    """Confirm a model is loaded and its context length covers MIN_CONTEXT_LENGTH."""
+    """Confirm exactly one chat-capable model is loaded and its context length covers MIN_CONTEXT_LENGTH.
+    Embedding models are excluded — LM Studio can have one loaded alongside a chat model (e.g. for
+    other tools), and grabbing "whichever is loaded" without filtering picks the wrong one silently."""
     resp = requests.get(MODELS_ENDPOINT, timeout=10)
     resp.raise_for_status()
     models = resp.json().get("data", [])
     loaded = [m for m in models if m.get("state") == "loaded"]
-    if not loaded:
-        raise RuntimeError("No model is currently loaded in LM Studio.")
-    model = loaded[0]
-    model_id = model["id"]
-    context_length = model.get("loaded_context_length")
 
     if debug:
-        print(f"[model] {model_id} | loaded_context_length={context_length}")
+        for m in loaded:
+            print(f"[model] {m['id']} | type={m.get('type')} | "
+                  f"loaded_context_length={m.get('loaded_context_length')}")
+
+    chat_models = [m for m in loaded if m.get("type") != "embeddings"]
+    if not chat_models:
+        raise RuntimeError(
+            "No chat-capable model is loaded in LM Studio (only an embedding model, or nothing, "
+            "is loaded). Load a chat model in LM Studio and try again."
+        )
+    if len(chat_models) > 1:
+        names = ", ".join(m["id"] for m in chat_models)
+        raise RuntimeError(
+            f"Multiple chat-capable models are loaded ({names}) — unload all but the one you want "
+            f"cleanup.py to use, so there's no ambiguity about which one gets called."
+        )
+
+    model = chat_models[0]
+    model_id = model["id"]
+    context_length = model.get("loaded_context_length")
 
     if context_length is None:
         print(f"WARNING: could not read loaded_context_length for {model_id}; "
@@ -459,6 +494,25 @@ def scan_pass(model_id, lines, debug=False, pass_label=""):
     return cuts, None
 
 
+def scan_and_verify(model_id, lines, debug=False, pass_label=""):
+    """One full scan_pass over `lines` plus the sandwiched-gap verification, returning
+    (cuts, gave_up_reason) the same way scan_pass does. `cuts` is 1-indexed inclusive ranges
+    relative to `lines`."""
+    cuts, gave_up_reason = scan_pass(model_id, lines, debug, pass_label=pass_label)
+    if gave_up_reason:
+        return None, gave_up_reason
+
+    extra_cuts = verify_sandwiched_gaps(model_id, lines, cuts, debug)
+    if extra_cuts:
+        if debug:
+            prefix = f"[{pass_label}] " if pass_label else ""
+            print(f"  {prefix}[verify] {len(extra_cuts)} additional range(s) confirmed as metadata:")
+            print_cut_preview(lines, extra_cuts)
+        cuts = cuts + extra_cuts
+
+    return cuts, None
+
+
 def clean_file(input_path, output_dir, review_dir, model_id, debug=False):
     name = os.path.basename(input_path)
     print(f"Processing {name}...")
@@ -473,23 +527,52 @@ def clean_file(input_path, output_dir, review_dir, model_id, debug=False):
             f.write(text)
         print(f"  -> review/ ({reason})")
 
-    cuts, gave_up_reason = scan_pass(model_id, lines, debug, pass_label="scan")
+    cuts, gave_up_reason = scan_and_verify(model_id, lines, debug, pass_label="scan")
     if gave_up_reason:
         route_to_review(gave_up_reason)
         return
-
-    extra_cuts = verify_sandwiched_gaps(model_id, lines, cuts, debug)
-    if extra_cuts:
-        if debug:
-            print(f"  [verify] {len(extra_cuts)} additional range(s) confirmed as metadata:")
-            print_cut_preview(lines, extra_cuts)
-        cuts = cuts + extra_cuts
 
     if debug:
         print(f"  [cuts] {len(cuts)} total range(s):")
         print_cut_preview(lines, cuts)
 
     kept_lines, removed_count = apply_cuts(lines, cuts)
+
+    # Heavily-cut files often keep a few residual metadata lines the windowed first pass walked
+    # past. Re-scan the cleaned text (fresh numbering) until a pass removes nothing, capped at
+    # RESCAN_MAX_PASSES. Any pass that wants to remove more than a small margin is not trusted:
+    # the file goes to review/ instead.
+    needs_rescan = (removed_count / total_lines if total_lines else 0) >= RESCAN_TRIGGER_RATIO \
+        or len(merge_ranges(cuts)) >= RESCAN_TRIGGER_CUTS
+    if needs_rescan:
+        for pass_num in range(2, RESCAN_MAX_PASSES + 1):
+            rescan_cuts, gave_up_reason = scan_and_verify(
+                model_id, kept_lines, debug, pass_label=f"rescan {pass_num}")
+            if gave_up_reason:
+                if debug:
+                    print(f"  [rescan {pass_num}] {gave_up_reason} — keeping previous result")
+                break
+
+            prev_len = len(kept_lines)
+            rescanned_lines, rescan_removed = apply_cuts(kept_lines, rescan_cuts)
+            if rescan_removed == 0:
+                if debug:
+                    print(f"  [rescan {pass_num}] no residual metadata found — converged")
+                break
+
+            guard = max(RESCAN_SAFE_MIN_LINES, int(prev_len * RESCAN_SAFE_RATIO))
+            if rescan_removed > guard:
+                route_to_review(
+                    f"re-scan pass {pass_num} wanted to remove {rescan_removed} more line(s) "
+                    f"({rescan_removed / prev_len:.0%} of the cleaned text) — too much to trust")
+                return
+
+            if debug:
+                print(f"  [rescan {pass_num}] removed {rescan_removed} residual line(s):")
+                print_cut_preview(kept_lines, rescan_cuts)
+            kept_lines = rescanned_lines
+            removed_count += rescan_removed
+
     removed_ratio = removed_count / total_lines if total_lines else 0
 
     if removed_ratio > REVIEW_MAX_REMOVED_RATIO:
@@ -508,6 +591,34 @@ def clean_file(input_path, output_dir, review_dir, model_id, debug=False):
 # Main
 # =============================================================
 
+def normalize_dropped_path(raw):
+    """Clean up a path pasted or drag-and-dropped into the terminal.
+
+    Linux file managers wrap the dropped path in single quotes (and shell-escape
+    spaces), or hand over a file:// URI. Strip all of that back to a plain path."""
+    s = raw.strip()
+    if not s:
+        return s
+
+    # file:///home/user/My%20Dir -> /home/user/My Dir
+    if s.startswith(("file://", "file:")):
+        parsed = urlparse(s)
+        return unquote(parsed.path)
+
+    # Surrounding matching quotes, or shell-escaped tokens like 'My\ Dir'.
+    try:
+        parts = shlex.split(s)
+        if len(parts) == 1:
+            return parts[0]
+    except ValueError:
+        pass
+
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "'\"":
+        return s[1:-1]
+
+    return s
+
+
 def main():
     parser = argparse.ArgumentParser(description="Remove archive metadata from story text files using an LLM.")
     parser.add_argument("input_file", nargs="?", help="Path to a .txt file to clean. If omitted, you'll be "
@@ -516,6 +627,7 @@ def main():
     args = parser.parse_args()
 
     if args.input_file:
+        args.input_file = os.path.expanduser(normalize_dropped_path(args.input_file))
         if not os.path.exists(args.input_file):
             print(f"Error: file not found: {args.input_file}")
             sys.exit(1)
@@ -532,7 +644,8 @@ def main():
         clean_file(args.input_file, output_dir, review_dir, model_id, debug=args.debug)
 
     else:
-        directory = input("Enter directory to process: ").strip()
+        directory = normalize_dropped_path(input("Enter directory to process: "))
+        directory = os.path.expanduser(directory)
         if not os.path.isdir(directory):
             print(f"Error: '{directory}' is not a valid directory.")
             sys.exit(1)

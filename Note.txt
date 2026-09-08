@@ -1,0 +1,3 @@
+tested with Gemma-4-12b-uncensored
+No thinking
+Works very well with qwen 3.6 27b ablterataed, no thinking
