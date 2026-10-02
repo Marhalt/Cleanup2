@@ -655,57 +655,54 @@ def normalize_dropped_path(raw):
 
 def main():
     parser = argparse.ArgumentParser(description="Remove archive metadata from story text files using an LLM.")
-    parser.add_argument("input_file", nargs="?", help="Path to a .txt file to clean. If omitted, you'll be "
-                                                        "prompted for a directory to clean every .txt file in.")
+    parser.add_argument("input_path", nargs="?", help="Path to a .txt file to clean, or a directory to clean "
+                                                        "every .txt file in. If omitted, you'll be prompted "
+                                                        "for a directory.")
     parser.add_argument("-d", "--debug", action="store_true", help="Print scan/LLM debug info")
     parser.add_argument("-f", "--force", action="store_true",
                         help="When a file would be sent to review/ untouched, apply the cuts anyway and "
                              "write the cleaned result to review/ instead, to inspect what went wrong")
     args = parser.parse_args()
 
-    if args.input_file:
-        args.input_file = os.path.expanduser(normalize_dropped_path(args.input_file))
-        if not os.path.exists(args.input_file):
-            print(f"Error: file not found: {args.input_file}")
+    if args.input_path:
+        input_path = os.path.expanduser(normalize_dropped_path(args.input_path))
+        if not os.path.exists(input_path):
+            print(f"Error: file or directory not found: {input_path}")
             sys.exit(1)
-
-        model_id = get_model_info(debug=args.debug)
-        print(f"Model: {model_id}")
-
-        base_dir = os.path.dirname(os.path.abspath(args.input_file))
-        output_dir = os.path.join(base_dir, "cleaned")
-        review_dir = os.path.join(base_dir, "review")
-        os.makedirs(output_dir, exist_ok=True)
-        os.makedirs(review_dir, exist_ok=True)
-
-        clean_file(args.input_file, output_dir, review_dir, model_id, debug=args.debug, force=args.force)
-
     else:
-        directory = normalize_dropped_path(input("Enter directory to process: "))
-        directory = os.path.expanduser(directory)
-        if not os.path.isdir(directory):
-            print(f"Error: '{directory}' is not a valid directory.")
+        input_path = os.path.expanduser(normalize_dropped_path(input("Enter directory to process: ")))
+        if not os.path.isdir(input_path):
+            print(f"Error: '{input_path}' is not a valid directory.")
             sys.exit(1)
 
+    if os.path.isdir(input_path):
+        directory = input_path
         txt_files = sorted(f for f in os.listdir(directory) if f.lower().endswith(".txt"))
         if not txt_files:
             print("No .txt files found in that directory.")
             return
+    else:
+        directory = os.path.dirname(os.path.abspath(input_path))
+        txt_files = None
 
-        model_id = get_model_info(debug=args.debug)
-        print(f"Model: {model_id}")
+    model_id = get_model_info(debug=args.debug)
+    print(f"Model: {model_id}")
 
-        output_dir = os.path.join(directory, "cleaned")
-        review_dir = os.path.join(directory, "review")
-        os.makedirs(output_dir, exist_ok=True)
-        os.makedirs(review_dir, exist_ok=True)
+    output_dir = os.path.join(directory, "cleaned")
+    review_dir = os.path.join(directory, "review")
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(review_dir, exist_ok=True)
 
-        print(f"Found {len(txt_files)} file(s). Output -> {output_dir}")
-        for filename in txt_files:
-            clean_file(os.path.join(directory, filename), output_dir, review_dir, model_id,
-                       debug=args.debug, force=args.force)
+    if txt_files is None:
+        clean_file(input_path, output_dir, review_dir, model_id, debug=args.debug, force=args.force)
+        return
 
-        print(f"\n=== All done. {len(txt_files)} file(s) processed. ===")
+    print(f"Found {len(txt_files)} file(s). Output -> {output_dir}")
+    for filename in txt_files:
+        clean_file(os.path.join(directory, filename), output_dir, review_dir, model_id,
+                   debug=args.debug, force=args.force)
+
+    print(f"\n=== All done. {len(txt_files)} file(s) processed. ===")
 
 
 if __name__ == "__main__":
