@@ -22,10 +22,11 @@ WINDOW_LINES     = 600      # lines per LLM call for start/scan/resume detection
                              # later one instead of the nearest one. 600 lines keeps the odds of
                              # more than one real boundary landing in a single window low without
                              # calling the LLM too often.
-MAX_RESUME_WINDOWS = 5       # safety cap on how many WINDOW_LINES chunks to search forward through
-                             # when looking for where the story resumes after a metadata block,
-                             # before giving up and routing the file to review/ instead of risking
-                             # either an infinite scan or a runaway deletion.
+MAX_RESUME_WINDOWS = 5       # how many WINDOW_LINES chunks a search for where the story starts or
+                             # resumes may run through before it counts as a runaway deletion. The
+                             # first pass keeps searching past it (so the file is still cleaned) but
+                             # flags the file for review/; a re-scan stops at it and keeps the
+                             # previous pass's result.
 RESPONSE_MAX_TOKENS = 500    # generous for a single small JSON object; this model reasons even with
                              # chat_template_kwargs enable_thinking=False (known LM Studio/Gemma-4
                              # bug: https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/2046),
@@ -332,7 +333,7 @@ def find_metadata_boundary(model_id, lines, window_start, window_end, debug=Fals
     return idx
 
 
-def scan_forward_for_resumption(model_id, lines, start_pos, debug=False, force=False):
+def scan_forward_for_resumption(model_id, lines, start_pos, debug=False, keep_going=False):
     """
     Scan forward from start_pos in WINDOW_LINES chunks looking for where story resumes.
     Returns (index, gave_up):
@@ -340,7 +341,7 @@ def scan_forward_for_resumption(model_id, lines, start_pos, debug=False, force=F
       - (None, False) — legitimately reached end of file with no story found (e.g. a footer)
       - (None, True)  — gave up after MAX_RESUME_WINDOWS without reaching EOF or finding story
 
-    With force=True the MAX_RESUME_WINDOWS cap is ignored and the search runs on to EOF. gave_up
+    With keep_going=True the MAX_RESUME_WINDOWS cap is ignored and the search runs on to EOF. gave_up
     is then True whenever the cap was exceeded, alongside whatever the longer search found, so
     the caller can still tell that a normal run would have bailed here.
     """
@@ -348,7 +349,7 @@ def scan_forward_for_resumption(model_id, lines, start_pos, debug=False, force=F
     pos = start_pos
     windows = 0
     while pos < n:
-        if windows >= MAX_RESUME_WINDOWS and not force:
+        if windows >= MAX_RESUME_WINDOWS and not keep_going:
             if debug:
                 print(f"    [scan_forward_for_resumption] gave up after {MAX_RESUME_WINDOWS} windows, "
                       f"still at line {pos + 1}")
@@ -442,14 +443,14 @@ def read_text(path):
             return f.read()
 
 
-def scan_pass(model_id, lines, debug=False, pass_label="", force=False):
+def scan_pass(model_id, lines, debug=False, pass_label="", keep_going=False):
     """
     Run one full start/scan/resume pass over `lines` (0-indexed list, fresh numbering — not
     necessarily the original file's line numbers if this is a second pass over already-cleaned
     text). Returns (cuts, gave_up_reason): cuts is a list of 1-indexed inclusive ranges relative to
     THIS input; gave_up_reason is None on success or a string describing why the pass bailed.
 
-    With force=True the pass never bails: it cuts whatever the model judged to be non-story and
+    With keep_going=True the pass never bails: it cuts whatever the model judged to be non-story and
     always returns cuts, and gave_up_reason instead lists every point where a normal run would
     have bailed (None if there were none).
     """
@@ -457,15 +458,15 @@ def scan_pass(model_id, lines, debug=False, pass_label="", force=False):
     prefix = f"[{pass_label}] " if pass_label else ""
     overridden = []
 
-    start_idx, gave_up = scan_forward_for_resumption(model_id, lines, 0, debug, force)
+    start_idx, gave_up = scan_forward_for_resumption(model_id, lines, 0, debug, keep_going)
     if gave_up:
         reason = f"{prefix}gave up looking for the story start"
-        if not force:
+        if not keep_going:
             return None, reason
         overridden.append(reason)
     if start_idx is None:
         reason = f"{prefix}no story prose found anywhere in the text"
-        if not force:
+        if not keep_going:
             return None, reason
         return [(1, total_lines)], "; ".join(overridden + [reason])
     if debug:
@@ -490,10 +491,10 @@ def scan_pass(model_id, lines, debug=False, pass_label="", force=False):
             cursor = window_end
             continue
 
-        resume_idx, gave_up = scan_forward_for_resumption(model_id, lines, boundary_idx + 1, debug, force)
+        resume_idx, gave_up = scan_forward_for_resumption(model_id, lines, boundary_idx + 1, debug, keep_going)
         if gave_up:
             reason = f"{prefix}gave up searching for where the story resumes after line {boundary_idx + 2}"
-            if not force:
+            if not keep_going:
                 return None, reason
             overridden.append(reason)
         if resume_idx is None:
@@ -512,11 +513,11 @@ def scan_pass(model_id, lines, debug=False, pass_label="", force=False):
     return cuts, "; ".join(overridden) or None
 
 
-def scan_and_verify(model_id, lines, debug=False, pass_label="", force=False):
+def scan_and_verify(model_id, lines, debug=False, pass_label="", keep_going=False):
     """One full scan_pass over `lines` plus the sandwiched-gap verification, returning
     (cuts, gave_up_reason) the same way scan_pass does. `cuts` is 1-indexed inclusive ranges
     relative to `lines`."""
-    cuts, gave_up_reason = scan_pass(model_id, lines, debug, pass_label=pass_label, force=force)
+    cuts, gave_up_reason = scan_pass(model_id, lines, debug, pass_label=pass_label, keep_going=keep_going)
     if cuts is None:
         return None, gave_up_reason
 
@@ -531,33 +532,23 @@ def scan_and_verify(model_id, lines, debug=False, pass_label="", force=False):
     return cuts, gave_up_reason
 
 
-def clean_file(input_path, output_dir, review_dir, model_id, debug=False, force=False):
-    """Clean one file into cleaned/, or copy it untouched into review/ if a safety guard trips.
-
-    With force=True a tripped guard is overridden instead: the cuts are applied anyway and the
-    result is written to review/ in place of the untouched original, so it can be diffed against
-    the input file to see what the guard was protecting against. Files that trip no guard are
-    unaffected by force and go to cleaned/ as usual."""
+def clean_file(input_path, output_dir, review_dir, model_id, debug=False):
+    """Clean one file and write the result to output_dir, or to review_dir if a safety guard
+    tripped along the way (scan gave up, a re-scan wanted too much, or too much was cut overall).
+    Guards never stop the cleaning: the cuts are always applied, so a file in review/ can be
+    diffed against the original to see what went wrong. Pass review_dir=None to write every
+    file to output_dir regardless of guards; tripped guards are still reported."""
     name = os.path.basename(input_path)
     print(f"Processing {name}...")
 
     text = read_text(input_path)
     lines = text.replace("\r", "").split("\n")
     total_lines = len(lines)
-    forced = []  # guards overridden by force; non-empty means the output belongs in review/
+    flagged = []  # reasons a guard tripped; non-empty means the output belongs in review/
 
-    def route_to_review(reason):
-        out_path = os.path.join(review_dir, name)
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(text)
-        print(f"  -> review/ ({reason})")
-
-    cuts, gave_up_reason = scan_and_verify(model_id, lines, debug, pass_label="scan", force=force)
+    cuts, gave_up_reason = scan_and_verify(model_id, lines, debug, pass_label="scan", keep_going=True)
     if gave_up_reason:
-        if not force:
-            route_to_review(gave_up_reason)
-            return
-        forced.append(gave_up_reason)
+        flagged.append(gave_up_reason)
 
     if debug:
         print(f"  [cuts] {len(cuts)} total range(s):")
@@ -568,7 +559,7 @@ def clean_file(input_path, output_dir, review_dir, model_id, debug=False, force=
     # Heavily-cut files often keep a few residual metadata lines the windowed first pass walked
     # past. Re-scan the cleaned text (fresh numbering) until a pass removes nothing, capped at
     # RESCAN_MAX_PASSES. Any pass that wants to remove more than a small margin is not trusted:
-    # the file goes to review/ instead.
+    # its cuts are still applied, but the file is flagged for review/.
     needs_rescan = (removed_count / total_lines if total_lines else 0) >= RESCAN_TRIGGER_RATIO \
         or len(merge_ranges(cuts)) >= RESCAN_TRIGGER_CUTS
     if needs_rescan:
@@ -589,12 +580,8 @@ def clean_file(input_path, output_dir, review_dir, model_id, debug=False, force=
 
             guard = max(RESCAN_SAFE_MIN_LINES, int(prev_len * RESCAN_SAFE_RATIO))
             if rescan_removed > guard:
-                reason = (f"re-scan pass {pass_num} wanted to remove {rescan_removed} more line(s) "
-                          f"({rescan_removed / prev_len:.0%} of the cleaned text) — too much to trust")
-                if not force:
-                    route_to_review(reason)
-                    return
-                forced.append(reason)
+                flagged.append(f"re-scan pass {pass_num} wanted to remove {rescan_removed} more line(s) "
+                               f"({rescan_removed / prev_len:.0%} of the cleaned text) — too much to trust")
 
             if debug:
                 print(f"  [rescan {pass_num}] removed {rescan_removed} residual line(s):")
@@ -605,20 +592,17 @@ def clean_file(input_path, output_dir, review_dir, model_id, debug=False, force=
     removed_ratio = removed_count / total_lines if total_lines else 0
 
     if removed_ratio > REVIEW_MAX_REMOVED_RATIO:
-        reason = f"{removed_ratio:.0%} of lines flagged for removal, looked too aggressive"
-        if not force:
-            route_to_review(reason)
-            return
-        forced.append(reason)
+        flagged.append(f"{removed_ratio:.0%} of lines flagged for removal, looked too aggressive")
 
-    out_path = os.path.join(review_dir if forced else output_dir, name)
+    to_review = bool(flagged) and review_dir is not None
+    out_path = os.path.join(review_dir if to_review else output_dir, name)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(kept_lines))
 
     print(f"  Lines: {total_lines} -> {len(kept_lines)} kept "
           f"({removed_count} removed, {removed_ratio:.1%})")
-    for reason in forced:
-        print(f"  -> review/ FORCED, cuts applied anyway ({reason})")
+    for reason in flagged:
+        print(f"  -> {'review/' if to_review else 'flagged, kept in output (--force)'} ({reason})")
 
 
 # =============================================================
@@ -660,8 +644,8 @@ def main():
                                                         "for a directory.")
     parser.add_argument("-d", "--debug", action="store_true", help="Print scan/LLM debug info")
     parser.add_argument("-f", "--force", action="store_true",
-                        help="When a file would be sent to review/ untouched, apply the cuts anyway and "
-                             "write the cleaned result to review/ instead, to inspect what went wrong")
+                        help="Write every cleaned file to cleaned/, even ones a safety guard would "
+                             "normally send to review/")
     args = parser.parse_args()
 
     if args.input_path:
@@ -689,18 +673,18 @@ def main():
     print(f"Model: {model_id}")
 
     output_dir = os.path.join(directory, "cleaned")
-    review_dir = os.path.join(directory, "review")
+    review_dir = None if args.force else os.path.join(directory, "review")
     os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(review_dir, exist_ok=True)
+    if review_dir:
+        os.makedirs(review_dir, exist_ok=True)
 
     if txt_files is None:
-        clean_file(input_path, output_dir, review_dir, model_id, debug=args.debug, force=args.force)
+        clean_file(input_path, output_dir, review_dir, model_id, debug=args.debug)
         return
 
     print(f"Found {len(txt_files)} file(s). Output -> {output_dir}")
     for filename in txt_files:
-        clean_file(os.path.join(directory, filename), output_dir, review_dir, model_id,
-                   debug=args.debug, force=args.force)
+        clean_file(os.path.join(directory, filename), output_dir, review_dir, model_id, debug=args.debug)
 
     print(f"\n=== All done. {len(txt_files)} file(s) processed. ===")
 
