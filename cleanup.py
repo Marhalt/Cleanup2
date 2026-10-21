@@ -22,6 +22,13 @@ WINDOW_LINES     = 600      # lines per LLM call for start/scan/resume detection
                              # later one instead of the nearest one. 600 lines keeps the odds of
                              # more than one real boundary landing in a single window low without
                              # calling the LLM too often.
+# A window is also cut short of WINDOW_LINES when its text would overflow the loaded model's context.
+# Line count alone doesn't bound the prompt: a file whose paragraphs are each one long line can put
+# hundreds of thousands of characters in 600 lines, and LM Studio rejects the request outright.
+CHARS_PER_TOKEN    = 3.0     # conservative; English prose measured ~4.2 chars/token on Qwen
+CONTEXT_RESERVE    = 2_000   # tokens kept free for the instructions and the JSON response
+window_max_chars   = int((MIN_CONTEXT_LENGTH - CONTEXT_RESERVE) * CHARS_PER_TOKEN)
+                             # set from the loaded model's real context length in main()
 MAX_RESUME_WINDOWS = 5       # how many WINDOW_LINES chunks a search for where the story starts or
                              # resumes may run through before it counts as a runaway deletion. The
                              # first pass keeps searching past it (so the file is still cleaned) but
@@ -243,7 +250,19 @@ def get_model_info(debug=False):
             f"which is smaller than the configured floor ({MIN_CONTEXT_LENGTH}). "
             f"Increase the context length in LM Studio or lower MIN_CONTEXT_LENGTH."
         )
-    return model_id
+    return model_id, context_length
+
+
+def window_end_for(lines, start):
+    """End (0-indexed, exclusive) of the window starting at `start`: WINDOW_LINES lines, or fewer
+    if their numbered text would exceed window_max_chars. Always includes at least one line."""
+    end = min(start + WINDOW_LINES, len(lines))
+    used = 0
+    for i in range(start, end):
+        used += len(lines[i]) + len(str(i + 1)) + 3  # "N: " prefix and joining newline
+        if used > window_max_chars and i > start:
+            return i
+    return end
 
 
 def _post_chat(model_id, system_prompt, user_text, schema_name, schema, debug=False, log_label=""):
@@ -266,7 +285,10 @@ def _post_chat(model_id, system_prompt, user_text, schema_name, schema, debug=Fa
     }
 
     resp = requests.post(CHAT_ENDPOINT, json=payload, timeout=120)
-    resp.raise_for_status()
+    if not resp.ok:
+        # LM Studio puts the real reason (e.g. context overflow) in the body; raise_for_status drops it
+        raise requests.HTTPError(f"{resp.status_code} from LM Studio{tag}: {resp.text.strip()[:500]}",
+                                 response=resp)
     data = resp.json()
     message = data["choices"][0]["message"]
     content = message["content"]
@@ -354,7 +376,7 @@ def scan_forward_for_resumption(model_id, lines, start_pos, debug=False, keep_go
                 print(f"    [scan_forward_for_resumption] gave up after {MAX_RESUME_WINDOWS} windows, "
                       f"still at line {pos + 1}")
             return None, True
-        window_end = min(pos + WINDOW_LINES, n)
+        window_end = window_end_for(lines, pos)
         idx = find_story_line(model_id, lines, pos, window_end, debug)
         windows += 1
         if idx is not None:
@@ -478,7 +500,7 @@ def scan_pass(model_id, lines, debug=False, pass_label="", keep_going=False):
 
     cursor = start_idx
     while cursor < total_lines:
-        window_end = min(cursor + WINDOW_LINES, total_lines)
+        window_end = window_end_for(lines, cursor)
         if window_end < total_lines:
             snap = window_end
             while snap > cursor and lines[snap - 1].strip() != "":
@@ -638,6 +660,7 @@ def normalize_dropped_path(raw):
 
 
 def main():
+    global window_max_chars
     parser = argparse.ArgumentParser(description="Remove archive metadata from story text files using an LLM.")
     parser.add_argument("input_path", nargs="?", help="Path to a .txt file to clean, or a directory to clean "
                                                         "every .txt file in. If omitted, you'll be prompted "
@@ -669,7 +692,8 @@ def main():
         directory = os.path.dirname(os.path.abspath(input_path))
         txt_files = None
 
-    model_id = get_model_info(debug=args.debug)
+    model_id, context_length = get_model_info(debug=args.debug)
+    window_max_chars = int(((context_length or MIN_CONTEXT_LENGTH) - CONTEXT_RESERVE) * CHARS_PER_TOKEN)
     print(f"Model: {model_id}")
 
     output_dir = os.path.join(directory, "cleaned")
@@ -683,10 +707,21 @@ def main():
         return
 
     print(f"Found {len(txt_files)} file(s). Output -> {output_dir}")
+    failed = []
     for filename in txt_files:
-        clean_file(os.path.join(directory, filename), output_dir, review_dir, model_id, debug=args.debug)
+        try:
+            clean_file(os.path.join(directory, filename), output_dir, review_dir, model_id, debug=args.debug)
+        except requests.HTTPError as e:
+            # LM Studio rejected one request for this file; skip it rather than lose the whole batch.
+            # Connection errors (LM Studio down) still stop the run, since every file would fail.
+            print(f"  ERROR, file skipped and left unprocessed: {e}")
+            failed.append(filename)
 
-    print(f"\n=== All done. {len(txt_files)} file(s) processed. ===")
+    print(f"\n=== All done. {len(txt_files) - len(failed)} file(s) processed. ===")
+    if failed:
+        print(f"{len(failed)} file(s) skipped after an LM Studio error:")
+        for filename in failed:
+            print(f"  {filename}")
 
 
 if __name__ == "__main__":
